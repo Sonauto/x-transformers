@@ -41,7 +41,9 @@ def exists(val):
 def default(val, d):
     if exists(val):
         return val
-    return d() if callable(d) else d
+    # if hasattr(d, '__call__'):
+    #     return d()
+    return d
 
 def cast_tuple(val, depth):
     return val if isinstance(val, tuple) else (val,) * depth
@@ -1287,8 +1289,16 @@ class AttentionLayers(nn.Module):
 
         # go through the attention and feedforward layers
 
-        for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
-            is_last = ind == (len(self.layers) - 1)
+        for i in self.layers_execute_order:
+            # ind = i
+            layer_type = self.layer_types[i]
+            layer_dropout = self.layer_dropouts[i]
+            norm = self.layers[i][0]
+            block = self.layers[i][1]
+            residual_fn = self.layers[i][2]
+
+        # for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
+            # is_last = ind == (len(self.layers) - 1)
 
             if self.training and layer_dropout > 0. and random() < layer_dropout:
                 continue
@@ -1307,15 +1317,21 @@ class AttentionLayers(nn.Module):
             if return_hiddens:
                 layer_hiddens.append(x)
 
-            pre_norm, post_branch_norm, post_main_norm = norm
+            pre_norm = norm[0]
+            post_branch_norm = norm[1]
+            post_main_norm = norm[2]
 
             if exists(pre_norm):
                 x = pre_norm(x)
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, return_intermediates = True)
+                block_return = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = None, mem = layer_mem, return_intermediates = True) # cache = next(iter_attn_cache, None)
+                out = block_return[0]
+                inter = block_return[1]
             elif layer_type == 'c':
-                out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), return_intermediates = True)
+                block_return = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = None, return_intermediates = True) # cache = next(iter_attn_cache, None)
+                out = block_return[0]
+                inter = block_return[1]
             elif layer_type == 'f':
                 out = block(x)
 
