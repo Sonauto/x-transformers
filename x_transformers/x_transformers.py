@@ -1225,7 +1225,8 @@ class AttentionLayers(nn.Module):
         cache: Optional[LayerIntermediates] = None,
         cache_age = 1,
         return_hiddens = False,
-        rotary_pos_emb = None
+        rotary_pos_emb = None,
+        control = None,
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
 
@@ -1285,8 +1286,11 @@ class AttentionLayers(nn.Module):
 
         layer_variables = tuple(tuple(layer_variable[i] for i in self.layers_execute_order) for layer_variable in layer_variables)
 
+        decoder_split = len(self.layer_types) // 2
+
         # go through the attention and feedforward layers
 
+        control_idx = -1
         for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
             is_last = ind == (len(self.layers) - 1)
 
@@ -1337,6 +1341,10 @@ class AttentionLayers(nn.Module):
 
             if exists(post_main_norm):
                 x = post_main_norm(x)
+            
+            if control is not None and ind > decoder_split:
+                x = x + control[control_idx]
+                control_idx -= 1
 
         if return_hiddens:
             layer_hiddens.append(x)
