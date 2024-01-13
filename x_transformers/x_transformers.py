@@ -512,7 +512,7 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
 
 if version.parse(torch.__version__) >= version.parse('2.1.0'):
-    LayerNorm = partial(nn.LayerNorm)
+    LayerNorm = partial(nn.LayerNorm, bias = False)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):

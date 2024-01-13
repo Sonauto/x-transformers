@@ -72,8 +72,8 @@ class ContinuousTransformerWrapper(nn.Module):
 
         # project in and out
 
-        self.project_in = nn.Linear(dim_in, dim) if exists(dim_in) else nn.Identity()
-        self.project_out = nn.Linear(dim, dim_out) if exists(dim_out) else nn.Identity()
+        self.project_in = nn.Linear(dim_in, dim, bias = False) if exists(dim_in) else nn.Identity()
+        self.project_out = nn.Linear(dim, dim_out, bias = False) if exists(dim_out) else nn.Identity()
 
     def forward(
         self,
