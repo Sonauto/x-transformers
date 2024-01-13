@@ -1031,10 +1031,14 @@ class AttentionLayers(nn.Module):
         layer_dropout = 0.,
         cross_attn_tokens_dropout = 0.,
         disable_abs_pos_emb = None,
+        control_mode = "far",
         **kwargs
     ):
         super().__init__()
         rotary_pos_emb = rotary_pos_emb or rotary_xpos
+
+        assert control_mode in ["far", "next"]
+        self.control_mode = control_mode
 
         ff_kwargs, kwargs = groupby_prefix_and_trim('ff_', kwargs)
         attn_kwargs, kwargs = groupby_prefix_and_trim('attn_', kwargs)
@@ -1227,7 +1231,8 @@ class AttentionLayers(nn.Module):
         cache: Optional[LayerIntermediates] = None,
         cache_age = 1,
         return_hiddens = False,
-        rotary_pos_emb = None
+        rotary_pos_emb = None,
+        control = None,
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
 
@@ -1287,10 +1292,16 @@ class AttentionLayers(nn.Module):
 
         layer_variables = tuple(tuple(layer_variable[i] for i in self.layers_execute_order) for layer_variable in layer_variables)
 
+        decoder_split = len(self.layer_types) // 2
+
         # go through the attention and feedforward layers
 
+        ind = 0
+        if self.control_mode == "far":
+            control_idx = -1
+        elif self.control_mode == "next":
+            control_idx = 0
         for i in self.layers_execute_order:
-            # ind = i
             layer_type = self.layer_types[i]
             layer_dropout = self.layer_dropouts[i]
             norm = self.layers[i][0]
@@ -1353,6 +1364,14 @@ class AttentionLayers(nn.Module):
 
             if exists(post_main_norm):
                 x = post_main_norm(x)
+
+            if self.control_mode == "far" and control is not None and ind > decoder_split:
+                x = x + control[control_idx]
+                control_idx -= 1
+            elif self.control_mode == "next" and control is not None and ind < decoder_split:
+                x = x + control[control_idx]
+                control_idx += 1
+            ind += 1
 
         if return_hiddens:
             layer_hiddens.append(x)
