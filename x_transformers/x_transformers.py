@@ -1032,6 +1032,7 @@ class AttentionLayers(nn.Module):
         cross_attn_tokens_dropout = 0.,
         disable_abs_pos_emb = None,
         control_mode = "far",
+        compile_layers = False,
         **kwargs
     ):
         super().__init__()
@@ -1206,17 +1207,31 @@ class AttentionLayers(nn.Module):
             post_branch_norm = norm_fn() if sandwich_norm else None
             post_main_norm = norm_fn() if not pre_norm else None
 
-            norms = nn.ModuleList([
-                pre_branch_norm,
-                post_branch_norm,
-                post_main_norm
-            ])
+            if compile_layers:
+                norms = nn.ModuleList([
+                    torch.compile(pre_branch_norm) if pre_branch_norm is not None else None,
+                    torch.compile(post_branch_norm) if post_branch_norm is not None else None,
+                    torch.compile(post_main_norm) if post_main_norm is not None else None
+                ])
 
-            self.layers.append(nn.ModuleList([
-                norms,
-                layer,
-                residual
-            ]))
+                self.layers.append(nn.ModuleList([
+                    norms,
+                    torch.compile(layer),
+                    torch.compile(residual)
+                ]))
+            else:
+                norms = nn.ModuleList([
+                    pre_branch_norm,
+                    post_branch_norm,
+                    post_main_norm
+                ])
+
+                self.layers.append(nn.ModuleList([
+                    norms,
+                    layer,
+                    residual
+                ]))
+            
 
     def forward(
         self,
