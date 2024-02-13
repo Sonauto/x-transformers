@@ -210,13 +210,13 @@ class Attend(nn.Module):
 
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
 
-        # with torch.backends.cuda.sdp_kernel(**self.sdp_kwargs):
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask = mask,
-            dropout_p = self.dropout if self.training else 0., 
-            is_causal = causal
-        )
+        with torch.backends.cuda.sdp_kernel(**self.sdp_kwargs):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask = mask,
+                dropout_p = self.dropout if self.training else 0., 
+                is_causal = causal
+            )
 
         # for a row that is entirely masked out, should zero out the output of that row token
 
