@@ -1209,15 +1209,15 @@ class AttentionLayers(nn.Module):
 
             if compile_layers:
                 norms = nn.ModuleList([
-                    torch.compile(pre_branch_norm) if pre_branch_norm is not None else None,
-                    torch.compile(post_branch_norm) if post_branch_norm is not None else None,
-                    torch.compile(post_main_norm) if post_main_norm is not None else None
+                    torch.compile(pre_branch_norm, dynamic=False) if pre_branch_norm is not None else None,
+                    torch.compile(post_branch_norm, dynamic=False) if post_branch_norm is not None else None,
+                    torch.compile(post_main_norm, dynamic=False) if post_main_norm is not None else None
                 ])
 
                 self.layers.append(nn.ModuleList([
                     norms,
-                    torch.compile(layer),
-                    torch.compile(residual)
+                    torch.compile(layer, dynamic=False),
+                    torch.compile(residual, dynamic=False)
                 ]))
             else:
                 norms = nn.ModuleList([
