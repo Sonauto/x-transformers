@@ -833,6 +833,7 @@ class Attention(nn.Module):
     ):
         b, n, h, kv_h, head_scale, device, has_context = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, x.device, exists(context)
 
+        x_len = n
         kv_input = default(context, x) if not self.dual_input else x
 
         q_input = x
@@ -891,11 +892,11 @@ class Attention(nn.Module):
             freqs, xpos_scale = rotary_pos_emb
             q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale ** -1.) if exists(xpos_scale) else (1., 1.)
 
-            q[:, :x_len] = apply_rotary_pos_emb(q[:, :x_len], freqs, q_xpos_scale)
-            k[:, :x_len] = apply_rotary_pos_emb(k[:, :x_len], freqs, k_xpos_scale)
+            q[:, :, :x_len] = apply_rotary_pos_emb(q[:, :, :x_len], freqs, q_xpos_scale)
+            k[:, :, :x_len] = apply_rotary_pos_emb(k[:, :, :x_len], freqs, k_xpos_scale)
 
             if self.rotary_embed_values:
-                v[:, :x_len] = apply_rotary_pos_emb(v[:, :x_len], freqs, k_xpos_scale)
+                v[:, :, :x_len] = apply_rotary_pos_emb(v[:, :, :x_len], freqs, k_xpos_scale)
 
         input_mask = context_mask # if not self.dual_input else None
 
@@ -995,7 +996,6 @@ class Attention(nn.Module):
         out_context = None
         # print("dual input in attention", self.dual_input)
         if self.dual_input:
-            x_len = x.shape[1]
             context_len = context.shape[1] if context is not None else 0
             out_context = self.context_to_out(out[:, x_len:]) if context_len > 0 and not self.is_second_last_layer else None
             out = self.to_out(out[:, :x_len])
