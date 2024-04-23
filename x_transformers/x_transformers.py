@@ -697,7 +697,9 @@ class Attention(nn.Module):
         tensor_product = False,      # https://arxiv.org/abs/2208.06061
         add_zero_kv = False,         # same as add_zero_attn in pytorch
         rotary_embed_values = False,
-        onnxable = False
+        onnxable = False,
+        dual_input = False, # mm-dit from SD3
+        is_second_last_layer = False # we don't want to bother with context out
     ):
         super().__init__()
         dim_kv = default(dim_context, dim)
@@ -707,6 +709,10 @@ class Attention(nn.Module):
         self.heads = heads
         self.causal = causal
         self.max_attend_past = max_attend_past
+
+        self.dual_input = dual_input
+
+        self.is_second_last_layer = is_second_last_layer
 
         assert not (exists(kv_heads) and one_kv_head), 'either attn_one_kv_head is set to True (in which case kv_heads is set to 1), or attn_kv_heads is set, but not both'
 
@@ -729,6 +735,13 @@ class Attention(nn.Module):
         # shared key / values, for further memory savings during inference
         assert not (shared_kv and value_dim_head != dim_head), 'key and value head dimensions must be equal for shared key / values'
         self.to_v = nn.Linear(dim_kv, v_dim, bias = False) if not shared_kv else None
+
+        if dual_input:
+            # as specified in SD3, context gets its own linear layers
+            self.context_to_q = nn.Linear(dim, q_dim, bias = False)
+            self.context_to_k = nn.Linear(dim_kv, k_dim, bias = False)
+            self.context_to_v = nn.Linear(dim_kv, v_dim, bias = False) if not shared_kv else None
+            self.context_to_out = nn.Linear(dim, out_dim, bias = False) if not is_second_last_layer else None
 
         # relations projection from tp-attention
         self.to_r = nn.Linear(dim, v_dim, bias = False) if tensor_product else None
@@ -820,7 +833,7 @@ class Attention(nn.Module):
     ):
         b, n, h, kv_h, head_scale, device, has_context = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, x.device, exists(context)
 
-        kv_input = default(context, x)
+        kv_input = default(context, x) if not self.dual_input else x
 
         q_input = x
         k_input = kv_input
@@ -835,6 +848,14 @@ class Attention(nn.Module):
         k = self.to_k(k_input)
         v = self.to_v(v_input) if exists(self.to_v) else k
         r = self.to_r(r_input) if exists(self.to_r) else None
+
+        if self.dual_input:
+            context_q = self.context_to_q(context)
+            # print("context_q.shape", context_q.shape)
+            # print("q.shape", q.shape)
+            q = torch.cat((q, context_q), dim = -2)
+            k = torch.cat((k, self.context_to_k(context)), dim = -2)
+            v = torch.cat((v, self.context_to_v(context)), dim = -2) if exists(self.context_to_v) else k
 
         q = rearrange(q, 'b n (h d) -> b h n d', h = h)
 
@@ -866,17 +887,17 @@ class Attention(nn.Module):
             q = q * self.qk_norm_q_scale
             k = k * self.qk_norm_k_scale
 
-        if exists(rotary_pos_emb) and not has_context:
+        if exists(rotary_pos_emb) and not (has_context and not self.dual_input):
             freqs, xpos_scale = rotary_pos_emb
             q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale ** -1.) if exists(xpos_scale) else (1., 1.)
 
-            q = apply_rotary_pos_emb(q, freqs, q_xpos_scale)
-            k = apply_rotary_pos_emb(k, freqs, k_xpos_scale)
+            q[:, :x_len] = apply_rotary_pos_emb(q[:, :x_len], freqs, q_xpos_scale)
+            k[:, :x_len] = apply_rotary_pos_emb(k[:, :x_len], freqs, k_xpos_scale)
 
             if self.rotary_embed_values:
-                v = apply_rotary_pos_emb(v, freqs, k_xpos_scale)
+                v[:, :x_len] = apply_rotary_pos_emb(v[:, :x_len], freqs, k_xpos_scale)
 
-        input_mask = context_mask
+        input_mask = context_mask # if not self.dual_input else None
 
         if not exists(input_mask) and not has_context:
             input_mask = mask
@@ -906,6 +927,8 @@ class Attention(nn.Module):
         final_attn_mask = None
 
         if exists(input_mask):
+            # if self.dual_input: 
+            #     input_mask = torch.cat((input_mask, context_mask), dim = -1)
             input_mask = rearrange(input_mask, 'b j -> b 1 1 j')
             masks.append(~input_mask)
 
@@ -969,19 +992,30 @@ class Attention(nn.Module):
             out = out * self.to_v_gate_activation(gates)
 
         # combine the heads
-
-        out = self.to_out(out)
+        out_context = None
+        # print("dual input in attention", self.dual_input)
+        if self.dual_input:
+            x_len = x.shape[1]
+            context_len = context.shape[1] if context is not None else 0
+            out_context = self.context_to_out(out[:, x_len:]) if context_len > 0 and not self.is_second_last_layer else None
+            out = self.to_out(out[:, :x_len])
+            # out = torch.cat([out_x, out_context], dim=1) if out_context is not None else out_x
+        else:
+            # print("DUAL INPUT IS FALSE")
+            out = self.to_out(out)
 
         if exists(mask):
             mask = rearrange(mask, 'b n -> b n 1')
             out = out.masked_fill(~mask, 0.)
 
+        # print("out_context.shape", out_context.shape)
+
         if not return_intermediates:
-            return out
+            return out, None, out_context
 
         intermediates.cached_kv = cached_kv
 
-        return out, intermediates
+        return out, intermediates, out_context
 
 class AttentionLayers(nn.Module):
     def __init__(
@@ -1033,6 +1067,7 @@ class AttentionLayers(nn.Module):
         disable_abs_pos_emb = None,
         control_mode = "far",
         compile_layers = False,
+        dual_input = False,
         **kwargs
     ):
         super().__init__()
@@ -1051,6 +1086,7 @@ class AttentionLayers(nn.Module):
         self.depth = depth
         self.causal = causal
         self.layers = nn.ModuleList([])
+        self.dual_input = dual_input
 
         self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb))
 
@@ -1184,14 +1220,20 @@ class AttentionLayers(nn.Module):
 
         for ind, (layer_type, layer_shift_tokens) in enumerate(zip(self.layer_types, shift_tokens)):
             is_last_layer = ind == (len(self.layer_types) - 1)
+            is_second_last_layer = ind == (len(self.layer_types) - 2)
 
             if layer_type == 'a':
-                layer = Attention(dim, heads = heads, causal = causal, **attn_kwargs)
+                layer = Attention(dim, heads = heads, causal = causal, dual_input = dual_input, is_second_last_layer = is_second_last_layer, **attn_kwargs)
             elif layer_type == 'c':
+                if dual_input:
+                    # cross attention is cringe
+                    continue
                 layer = Attention(dim, heads = heads, **{**attn_kwargs, **cross_attn_kwargs})
             elif layer_type == 'f':
                 layer = FeedForward(dim, **ff_kwargs)
                 layer = layer if not macaron else Scale(0.5, layer)
+                if dual_input and not is_last_layer:
+                    second_layer = FeedForward(dim, **ff_kwargs)
             else:
                 raise Exception(f'invalid layer type {layer_type}')
 
@@ -1206,30 +1248,35 @@ class AttentionLayers(nn.Module):
             pre_branch_norm = norm_fn() if pre_norm else None
             post_branch_norm = norm_fn() if sandwich_norm else None
             post_main_norm = norm_fn() if not pre_norm else None
+            
+            norms = [pre_branch_norm, post_branch_norm, post_main_norm]
+
+            if dual_input:
+                context_residual = residual_fn(dim, scale_residual = scale_residual, scale_residual_constant = scale_residual_constant)
+                context_pre_branch_norm = norm_fn() if pre_norm and not is_last_layer else None
+                context_post_branch_norm = norm_fn() if sandwich_norm else None
+                context_post_main_norm = norm_fn() if not pre_norm and not is_last_layer else None
+                norms += [context_pre_branch_norm, context_post_branch_norm, context_post_main_norm]
 
             if compile_layers:
-                norms = nn.ModuleList([
-                    torch.compile(pre_branch_norm, dynamic=False) if pre_branch_norm is not None else None,
-                    torch.compile(post_branch_norm, dynamic=False) if post_branch_norm is not None else None,
-                    torch.compile(post_main_norm, dynamic=False) if post_main_norm is not None else None
-                ])
+                norms = nn.ModuleList([torch.compile(norm, dynamic=False) if norm is not None else None for norm in norms])
 
                 self.layers.append(nn.ModuleList([
                     norms,
                     torch.compile(layer, dynamic=False),
-                    torch.compile(residual, dynamic=False)
+                    torch.compile(residual, dynamic=False),
+                    torch.compile(context_residual, dynamic=False) if dual_input else None,
+                    torch.compile(second_layer, dynamic=False) if dual_input and layer_type == 'f' else None
                 ]))
             else:
-                norms = nn.ModuleList([
-                    pre_branch_norm,
-                    post_branch_norm,
-                    post_main_norm
-                ])
+                norms = nn.ModuleList(norms)
 
                 self.layers.append(nn.ModuleList([
                     norms,
                     layer,
-                    residual
+                    residual,
+                    context_residual if dual_input else None,
+                    second_layer if dual_input and layer_type == 'f' else None
                 ]))
             
 
@@ -1249,7 +1296,7 @@ class AttentionLayers(nn.Module):
         rotary_pos_emb = None,
         control = None,
     ):
-        assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
+        # assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
 
         # initialize accums
 
@@ -1317,14 +1364,18 @@ class AttentionLayers(nn.Module):
         elif self.control_mode == "next":
             control_idx = 0
         for i in self.layers_execute_order:
+            # print("Layer: ", i)
             layer_type = self.layer_types[i]
             layer_dropout = self.layer_dropouts[i]
             norm = self.layers[i][0]
             block = self.layers[i][1]
             residual_fn = self.layers[i][2]
+            context_residual_fn = self.layers[i][3] if self.dual_input else None
+            second_block = self.layers[i][4] if self.dual_input else None
 
         # for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
-            # is_last = ind == (len(self.layers) - 1)
+            is_last_layer = ind == (len(self.layers) - 1)
+            is_second_last_layer = ind == (len(self.layers) - 2)
 
             if self.training and layer_dropout > 0. and random() < layer_dropout:
                 continue
@@ -1339,6 +1390,7 @@ class AttentionLayers(nn.Module):
                     context, context_mask = dropout_seq(context, context_mask, self.cross_attn_tokens_dropout)
 
             inner_residual = x
+            inner_residual_context = context
 
             if return_hiddens:
                 layer_hiddens.append(x)
@@ -1347,27 +1399,60 @@ class AttentionLayers(nn.Module):
             post_branch_norm = norm[1]
             post_main_norm = norm[2]
 
+            if self.dual_input:
+                context_pre_norm = norm[3]
+                context_post_branch_norm = norm[4]
+                context_post_main_norm = norm[5]
+
             if exists(pre_norm):
                 x = pre_norm(x)
+                if self.dual_input and not is_last_layer:
+                    context = context_pre_norm(context)
 
             if layer_type == 'a':
-                block_return = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = None, mem = layer_mem, return_intermediates = True) # cache = next(iter_attn_cache, None)
+                # print("type a attention")
+                # print("x shape going in", x.shape)
+                # print("context shape going in", context.shape)
+                block_return = block(x, mask = mask, context = context if self.dual_input else None, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = None, mem = layer_mem, return_intermediates = True) # cache = next(iter_attn_cache, None)
                 out = block_return[0]
                 inter = block_return[1]
-            elif layer_type == 'c':
+                # print("dual input: " + str(self.dual_input) + "exists: " + str(exists(block_return[2])))
+                if self.dual_input:
+                    # print("happenign", block_return[2])
+                    context = block_return[2]
+                    # print("x shape coming out", out.shape)
+                    # print("context shape coming out", context.shape if context is not None else "it's NOOONE")
+            elif layer_type == 'c' and not self.dual_input:
+                # print("type c (cross) attention")
                 block_return = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = None, return_intermediates = True) # cache = next(iter_attn_cache, None)
                 out = block_return[0]
                 inter = block_return[1]
             elif layer_type == 'f':
+                # print("feedfoward")
+                # print("x shape going in", x.shape)
+                # print("context shape going in", context.shape)
                 out = block(x)
+                if self.dual_input and not is_last_layer:
+                    context = second_block(context)
+                    # print("x shape coming out", out.shape)
+                    # print("context shape coming out", context.shape)
 
             if self.resi_dual:
                 outer_residual = outer_residual + out * self.resi_dual_scale
 
             if exists(post_branch_norm):
                 out = post_branch_norm(out)
+                context = context_post_branch_norm(context) if self.dual_input else None
 
             x = residual_fn(out, inner_residual)
+
+            if self.dual_input and not (is_second_last_layer or is_last_layer):
+                # print("IND: ", ind)
+                # print("is_second_last_layer", is_second_last_layer)
+                # print("is_last_layer", is_last_layer)
+                context = context_residual_fn(context, inner_residual_context) if self.dual_input else None # TODO: NEED CONTEXT RESIDUAL AND ALSO THIS IS AN INTERMEDIATE TYPE FOR SOME REASON
+
+            # TODO: GET RESIDUAL GOING FOR CONTEXT/DUAL INPUT
 
             if layer_type in ('a', 'c') and return_hiddens:
                 intermediates.append(inter)
@@ -1379,6 +1464,7 @@ class AttentionLayers(nn.Module):
 
             if exists(post_main_norm):
                 x = post_main_norm(x)
+                context = context_post_main_norm(context) if self.dual_input else None
 
             if self.control_mode == "far" and control is not None and ind > decoder_split:
                 x = x + control[control_idx]
