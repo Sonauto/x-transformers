@@ -59,6 +59,10 @@ def maybe(fn):
         return fn(x, *args, **kwargs)
     return inner
 
+# for AdaLN
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
 class always():
     def __init__(self, val):
         self.val = val
@@ -533,6 +537,18 @@ class SimpleRMSNorm(nn.Module):
     def forward(self, x):
         return F.normalize(x, dim = -1) * self.scale
 
+# AdaLN, from AdaLN ViT
+class AdaLNModulation(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True)
+        )
+    def forward(self, y):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
+        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
 # residual and residual gates
 
 class Residual(nn.Module):
@@ -888,15 +904,19 @@ class Attention(nn.Module):
             q = q * self.qk_norm_q_scale
             k = k * self.qk_norm_k_scale
 
-        if exists(rotary_pos_emb) and not (has_context and not self.dual_input):
+        if exists(rotary_pos_emb) and self.dual_input:
             freqs, xpos_scale = rotary_pos_emb
             q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale ** -1.) if exists(xpos_scale) else (1., 1.)
 
             q[:, :, :x_len] = apply_rotary_pos_emb(q[:, :, :x_len], freqs, q_xpos_scale)
             k[:, :, :x_len] = apply_rotary_pos_emb(k[:, :, :x_len], freqs, k_xpos_scale)
 
+            q[:, :, x_len:] = apply_rotary_pos_emb(q[:, :, x_len:], freqs, q_xpos_scale)
+            k[:, :, x_len:] = apply_rotary_pos_emb(k[:, :, x_len:], freqs, k_xpos_scale)
+
             if self.rotary_embed_values:
                 v[:, :, :x_len] = apply_rotary_pos_emb(v[:, :, :x_len], freqs, k_xpos_scale)
+                v[:, :, x_len:] = apply_rotary_pos_emb(v[:, :, x_len:], freqs, k_xpos_scale)
 
         input_mask = context_mask # if not self.dual_input else None
 
@@ -1068,6 +1088,7 @@ class AttentionLayers(nn.Module):
         control_mode = "far",
         compile_layers = False,
         dual_input = False,
+        adaLN = False,
         **kwargs
     ):
         super().__init__()
@@ -1087,6 +1108,7 @@ class AttentionLayers(nn.Module):
         self.causal = causal
         self.layers = nn.ModuleList([])
         self.dual_input = dual_input
+        self.adaLN = adaLN
 
         self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb))
 
@@ -1147,7 +1169,7 @@ class AttentionLayers(nn.Module):
 
         norm_fn = partial(norm_class, dim)
 
-        if cross_attend and not only_cross:
+        if cross_attend and not only_cross and not dual_input:
             default_block = ('a', 'c', 'f')
         elif cross_attend and only_cross:
             default_block = ('c', 'f')
@@ -1257,6 +1279,12 @@ class AttentionLayers(nn.Module):
                 context_post_branch_norm = norm_fn() if sandwich_norm else None
                 context_post_main_norm = norm_fn() if not pre_norm and not is_last_layer else None
                 norms += [context_pre_branch_norm, context_post_branch_norm, context_post_main_norm]
+            
+            adaLN_layer = adaLN and layer_type == 'a'
+            
+            if adaLN_layer:
+                adaLN_modulation = AdaLNModulation(dim)
+                context_adaLN_modulation = AdaLNModulation(dim) if dual_input and not is_second_last_layer else None
 
             if compile_layers:
                 norms = nn.ModuleList([torch.compile(norm, dynamic=False) if norm is not None else None for norm in norms])
@@ -1266,7 +1294,9 @@ class AttentionLayers(nn.Module):
                     torch.compile(layer, dynamic=False),
                     torch.compile(residual, dynamic=False),
                     torch.compile(context_residual, dynamic=False) if dual_input else None,
-                    torch.compile(second_layer, dynamic=False) if dual_input and layer_type == 'f' else None
+                    torch.compile(second_layer, dynamic=False) if dual_input and layer_type == 'f' else None,
+                    torch.compile(adaLN_modulation, dynamic=False) if adaLN_layer else None,
+                    torch.compile(context_adaLN_modulation, dynamic=False) if adaLN_layer and dual_input and not is_second_last_layer else None
                 ]))
             else:
                 norms = nn.ModuleList(norms)
@@ -1276,7 +1306,9 @@ class AttentionLayers(nn.Module):
                     layer,
                     residual,
                     context_residual if dual_input else None,
-                    second_layer if dual_input and layer_type == 'f' else None
+                    second_layer if dual_input and layer_type == 'f' else None,
+                    adaLN_modulation if adaLN_layer else None,
+                    context_adaLN_modulation if adaLN_layer and dual_input and not is_second_last_layer else None
                 ]))
             
 
@@ -1295,8 +1327,11 @@ class AttentionLayers(nn.Module):
         return_hiddens = False,
         rotary_pos_emb = None,
         control = None,
+        global_cond = None,
     ):
         # assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
+        # assert that if self.adaLN is set, then global_cond is not None
+        assert not (self.adaLN and global_cond is None), 'global condition must be passed in if adaLN is set to True'
 
         # initialize accums
 
@@ -1323,7 +1358,8 @@ class AttentionLayers(nn.Module):
         # rotary positions
 
         if not exists(rotary_pos_emb) and exists(self.rotary_pos_emb):
-            max_rotary_emb_length = max(list(map(lambda m: (m.shape[1] if exists(m) else 0) + x.shape[1], mems)))
+            extra_from_dual_input = 0 #if not self.dual_input else context.shape[1]  # failed experiment to rope whole dual_input thing
+            max_rotary_emb_length = max(list(map(lambda m: (m.shape[1] if exists(m) else 0) + x.shape[1] + extra_from_dual_input, mems)))
             rotary_pos_emb = self.rotary_pos_emb.forward_from_seq_len(max_rotary_emb_length)
 
         # assume cached key / values
@@ -1355,6 +1391,9 @@ class AttentionLayers(nn.Module):
         layer_variables = tuple(tuple(layer_variable[i] for i in self.layers_execute_order) for layer_variable in layer_variables)
 
         decoder_split = len(self.layer_types) // 2
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = None, None, None, None, None, None
+        shift_msa_context, scale_msa_context, gate_msa_context, shift_mlp_context, scale_mlp_context, gate_mlp_context = None, None, None, None, None, None
 
         # go through the attention and feedforward layers
 
@@ -1404,10 +1443,21 @@ class AttentionLayers(nn.Module):
                 context_post_branch_norm = norm[4]
                 context_post_main_norm = norm[5]
 
+            anaLN_layer = self.adaLN and layer_type == 'a'
+
+            if anaLN_layer:
+                adaLN_modulation = self.layers[i][5]
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaLN_modulation(global_cond)
+                if self.dual_input and not is_second_last_layer:
+                    context_adaLN_modulation = self.layers[i][6]
+                    shift_msa_context, scale_msa_context, gate_msa_context, shift_mlp_context, scale_mlp_context, gate_mlp_context = context_adaLN_modulation(global_cond)
+
             if exists(pre_norm):
-                x = pre_norm(x)
+                x = pre_norm(x) if not self.adaLN else modulate(pre_norm(x), shift_msa if layer_type == 'a' else shift_mlp, scale_msa if layer_type == 'a' else scale_mlp)
                 if self.dual_input and not is_last_layer:
-                    context = context_pre_norm(context)
+                    context = context_pre_norm(context) if not self.adaLN else modulate(context_pre_norm(context), shift_msa_context if layer_type == 'a' else shift_mlp_context, scale_msa_context if layer_type == 'a' else scale_mlp_context)
+            
+                
 
             if layer_type == 'a':
                 # print("type a attention")
@@ -1416,10 +1466,15 @@ class AttentionLayers(nn.Module):
                 block_return = block(x, mask = mask, context = context if self.dual_input else None, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = None, mem = layer_mem, return_intermediates = True) # cache = next(iter_attn_cache, None)
                 out = block_return[0]
                 inter = block_return[1]
+
+                if self.adaLN:
+                    out *= gate_msa.unsqueeze(1)
                 # print("dual input: " + str(self.dual_input) + "exists: " + str(exists(block_return[2])))
-                if self.dual_input:
+                if self.dual_input and not is_second_last_layer:
                     # print("happenign", block_return[2])
                     context = block_return[2]
+                    if self.adaLN:
+                        context *= gate_msa_context.unsqueeze(1)
                     # print("x shape coming out", out.shape)
                     # print("context shape coming out", context.shape if context is not None else "it's NOOONE")
             elif layer_type == 'c' and not self.dual_input:
@@ -1432,8 +1487,12 @@ class AttentionLayers(nn.Module):
                 # print("x shape going in", x.shape)
                 # print("context shape going in", context.shape)
                 out = block(x)
+                if self.adaLN:
+                    out *= gate_mlp.unsqueeze(1)
                 if self.dual_input and not is_last_layer:
                     context = second_block(context)
+                    if self.adaLN:
+                        context *= gate_mlp_context.unsqueeze(1)
                     # print("x shape coming out", out.shape)
                     # print("context shape coming out", context.shape)
 
