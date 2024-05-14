@@ -917,6 +917,15 @@ class Attention(nn.Module):
             if self.rotary_embed_values:
                 v[:, :, :x_len] = apply_rotary_pos_emb(v[:, :, :x_len], freqs, k_xpos_scale)
                 v[:, :, x_len:] = apply_rotary_pos_emb(v[:, :, x_len:], freqs, k_xpos_scale)
+        elif exists(rotary_pos_emb) and not has_context:
+            freqs, xpos_scale = rotary_pos_emb
+            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale ** -1.) if exists(xpos_scale) else (1., 1.)
+
+            q = apply_rotary_pos_emb(q, freqs, q_xpos_scale)
+            k = apply_rotary_pos_emb(k, freqs, k_xpos_scale)
+
+            if self.rotary_embed_values:
+                v = apply_rotary_pos_emb(v, freqs, k_xpos_scale)
 
         input_mask = context_mask # if not self.dual_input else None
 
