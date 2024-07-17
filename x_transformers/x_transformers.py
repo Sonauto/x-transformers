@@ -681,7 +681,7 @@ class FeedForward(nn.Module):
         return self.ff(x)
 
 # attention. it is all we need
-
+import xformers.ops as xops
 class Attention(nn.Module):
     def __init__(
         self,
@@ -852,6 +852,15 @@ class Attention(nn.Module):
         x_len = n
         kv_input = default(context, x) if not self.dual_input else x
 
+        mask_override = None
+        kv_seq_lens = None
+        if context is not None:
+            # print("kv_input[0].shape", kv_input[0].shape)
+            # print("kv_input[1].shape", kv_input[1].shape)
+            kv_seq_lens = [x.shape[0] for x in kv_input]
+            mask_override = xops.fmha.BlockDiagonalMask.from_seqlens([x.shape[1],]*b, kv_seq_lens)
+            kv_input = torch.cat(kv_input, dim=0).unsqueeze(0)
+
         q_input = x
         k_input = kv_input
         v_input = kv_input
@@ -991,6 +1000,8 @@ class Attention(nn.Module):
         out, intermediates = self.attend(
             q, k, v,
             mask = final_attn_mask,
+            my_mask = mask_override,
+            kv_seq_lens = kv_seq_lens,
             attn_bias = attn_bias,
             prev_attn = prev_attn
         )
@@ -1296,16 +1307,16 @@ class AttentionLayers(nn.Module):
                 context_adaLN_modulation = AdaLNModulation(dim) if dual_input and not is_second_last_layer else None
 
             if compile_layers:
-                norms = nn.ModuleList([torch.compile(norm, dynamic=False) if norm is not None else None for norm in norms])
+                norms = nn.ModuleList([torch.compile(norm) if norm is not None else None for norm in norms])
 
                 self.layers.append(nn.ModuleList([
                     norms,
-                    torch.compile(layer, dynamic=False),
-                    torch.compile(residual, dynamic=False),
-                    torch.compile(context_residual, dynamic=False) if dual_input else None,
-                    torch.compile(second_layer, dynamic=False) if dual_input and layer_type == 'f' else None,
-                    torch.compile(adaLN_modulation, dynamic=False) if adaLN_layer else None,
-                    torch.compile(context_adaLN_modulation, dynamic=False) if adaLN_layer and dual_input and not is_second_last_layer else None
+                    torch.compile(layer),
+                    torch.compile(residual),
+                    torch.compile(context_residual) if dual_input else None,
+                    torch.compile(second_layer) if dual_input and layer_type == 'f' else None,
+                    torch.compile(adaLN_modulation) if adaLN_layer else None,
+                    torch.compile(context_adaLN_modulation) if adaLN_layer and dual_input and not is_second_last_layer else None
                 ]))
             else:
                 norms = nn.ModuleList(norms)
