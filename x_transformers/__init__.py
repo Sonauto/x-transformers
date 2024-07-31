@@ -6,7 +6,9 @@ from x_transformers.x_transformers import (
     CrossAttender,
     Attention,
     TransformerWrapper,
-    ViTransformerWrapper
+    ViTransformerWrapper,
+    FeedForward,
+    AttentionLayer
 )
 
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper

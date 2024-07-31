@@ -402,6 +402,7 @@ class AlibiPositionalBias(nn.Module):
 
         return self.bias
 
+
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -413,13 +414,10 @@ class RotaryEmbedding(nn.Module):
         base_rescale_factor = 1.
     ):
         super().__init__()
-        # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
-        # has some connection to NTK literature
-        # https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/
         base *= base_rescale_factor ** (dim / (dim - 2))
 
         inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer('inv_freq', inv_freq.float(), persistent=False)
 
         assert interpolation_factor >= 1.
         self.interpolation_factor = interpolation_factor
@@ -431,52 +429,67 @@ class RotaryEmbedding(nn.Module):
         scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
 
         self.scale_base = scale_base
-        self.register_buffer('scale', scale)
+        self.register_buffer('scale', scale.float())
+
+    def to(self, *args, **kwargs):
+        # Ignore any attempt to change the dtype
+        device = kwargs.get('device', None)
+        if device is not None:
+            self.inv_freq = self.inv_freq.to(device)
+            if hasattr(self, 'scale') and self.scale is not None:
+                self.scale = self.scale.to(device)
+        return self
 
     def forward_from_seq_len(self, seq_len):
         device = self.inv_freq.device
-
-        t = torch.arange(seq_len, device = device)
+        t = torch.arange(seq_len, device=device)
         return self.forward(t)
 
-    @autocast(enabled = False)
+    @autocast(enabled=False)
     def forward(self, t):
         device = self.inv_freq.device
+        input_dtype = t.dtype
 
-        t = t.type_as(self.inv_freq)
+        t = t.float()
+        self.inv_freq = self.inv_freq.float()
 
         t = t / self.interpolation_factor
 
         freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
-        freqs = torch.cat((freqs, freqs), dim = -1)
+        freqs = torch.cat((freqs, freqs), dim=-1)
 
         if not exists(self.scale):
-            return freqs, 1.
-
-        power = (torch.arange(seq_len, device = device) - (seq_len // 2)) / self.scale_base
+            return freqs.to(input_dtype), torch.tensor(1., dtype=input_dtype, device=device)
+        
+        power = (torch.arange(t.shape[0], device=device) - (t.shape[0] // 2)) / self.scale_base
         scale = self.scale ** rearrange(power, 'n -> n 1')
-        scale = torch.cat((scale, scale), dim = -1)
+        scale = torch.cat((scale, scale), dim=-1)
 
-        return freqs, scale
-
+        return freqs.to(input_dtype), scale.to(input_dtype)
 
 def rotate_half(x):
-    x = rearrange(x, '... (j d) -> ... j d', j = 2)
-    x1, x2 = x.unbind(dim = -2)
-    return torch.cat((-x2, x1), dim = -1)
+    x = x.float()
+    x = rearrange(x, '... (j d) -> ... j d', j=2)
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
 
-@autocast(enabled = False)
-def apply_rotary_pos_emb(t, freqs, scale = 1):
+@autocast(enabled=False)
+def apply_rotary_pos_emb(t, freqs, scale=1):
+    input_dtype = t.dtype
+    t = t.float()
+    freqs = freqs.float()
+    scale = scale.float() if torch.is_tensor(scale) else float(scale)
+
     rot_dim, seq_len = freqs.shape[-1], t.shape[-2]
     freqs = freqs[-seq_len:, :]
 
     if t.ndim == 4 and freqs.ndim == 3:
         freqs = rearrange(freqs, 'b n d -> b 1 n d')
 
-    # partial rotary embeddings, Wang et al. GPT-J
     t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
     t = (t * freqs.cos() * scale) + (rotate_half(t) * freqs.sin() * scale)
-    return torch.cat((t, t_unrotated), dim = -1)
+
+    return torch.cat((t, t_unrotated), dim=-1).to(input_dtype)
 
 # norms
 
@@ -1045,6 +1058,168 @@ class Attention(nn.Module):
         intermediates.cached_kv = cached_kv
 
         return out, intermediates, out_context
+    
+class AttentionLayer(nn.Module):
+    def __init__(
+            self, 
+            layer_type,
+            layer_dropout,
+            norm,
+            block,
+            residual_fn,
+            ):
+        super().__init__()
+        
+        self.layer_type = layer_type
+        self.layer_dropout = layer_dropout
+        self.norm = norm
+        self.block = block
+        self.residual_fn = residual_fn
+        self.dual_input = False
+
+
+    def forward(
+            self, 
+            x, 
+            mask = None,
+            context = None,
+            context_mask = None,
+            self_attn_kv_mask = None,
+            attn_mask = None,
+            rotary_pos_emb = None,
+            layer_mem = None,
+            rel_pos = None
+            ):
+        # print("Layer: ", i)
+        layer_type = self.layer_type
+        # layer_dropout = self.layer_dropout
+        norm = self.norm
+        block = self.block
+        residual_fn = self.residual_fn
+        # context_residual_fn = self.context_residual_fn
+        # second_block = self.second_block
+
+    # for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
+        # is_last_layer = ind == (len(self.layers) - 1)
+        # is_second_last_layer = ind == (len(self.layers) - 2)
+
+        # if self.training and layer_dropout > 0. and random() < layer_dropout:
+        #     continue
+
+        # if layer_type == 'a':
+        #     if return_hiddens:
+        #         hiddens.append(x)
+        #     layer_mem = mems.pop(0) if mems else None
+
+        # if layer_type == 'c':
+        #     if self.training and self.cross_attn_tokens_dropout > 0.:
+        #         context, context_mask = dropout_seq(context, context_mask, self.cross_attn_tokens_dropout)
+
+        inner_residual = x
+        # inner_residual_context = context
+
+        # if return_hiddens:
+        #     layer_hiddens.append(x)
+
+        pre_norm = norm[0]
+        post_branch_norm = norm[1]
+        post_main_norm = norm[2]
+
+        # if self.dual_input:
+        #     context_pre_norm = norm[3]
+        #     context_post_branch_norm = norm[4]
+        #     context_post_main_norm = norm[5]
+
+        # anaLN_layer = self.adaLN and layer_type == 'a'
+
+        # if anaLN_layer:
+        #     adaLN_modulation = self.layers[i][5]
+        #     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaLN_modulation(global_cond)
+        #     if self.dual_input and not is_second_last_layer:
+        #         context_adaLN_modulation = self.layers[i][6]
+        #         shift_msa_context, scale_msa_context, gate_msa_context, shift_mlp_context, scale_mlp_context, gate_mlp_context = context_adaLN_modulation(global_cond)
+
+        if exists(pre_norm):
+            x = pre_norm(x) #if not self.adaLN else modulate(pre_norm(x), shift_msa if layer_type == 'a' else shift_mlp, scale_msa if layer_type == 'a' else scale_mlp)
+            # if self.dual_input and not is_last_layer:
+            #     context = context_pre_norm(context) if not self.adaLN else modulate(context_pre_norm(context), shift_msa_context if layer_type == 'a' else shift_mlp_context, scale_msa_context if layer_type == 'a' else scale_mlp_context)
+        
+            
+        inter = None
+        if layer_type == 'a':
+            # print("type a attention")
+            # print("x shape going in", x.shape)
+            # print("context shape going in", context.shape)
+            block_return = block(x, mask = mask, context = context if self.dual_input else None, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = rel_pos, rotary_pos_emb = rotary_pos_emb, cache = None, mem = layer_mem, return_intermediates = True) # cache = next(iter_attn_cache, None)
+            out = block_return[0]
+            inter = block_return[1]
+
+            # if self.adaLN:
+            #     out *= gate_msa.unsqueeze(1)
+            # print("dual input: " + str(self.dual_input) + "exists: " + str(exists(block_return[2])))
+            # if self.dual_input and not is_second_last_layer:
+            #     # print("happenign", block_return[2])
+            #     context = block_return[2]
+            #     if self.adaLN:
+            #         context *= gate_msa_context.unsqueeze(1)
+                # print("x shape coming out", out.shape)
+                # print("context shape coming out", context.shape if context is not None else "it's NOOONE")
+        elif layer_type == 'c' and not self.dual_input:
+            # print("type c (cross) attention")
+            block_return = block(x, context = context, mask = mask, context_mask = context_mask, cache = None, return_intermediates = True) # cache = next(iter_attn_cache, None)
+            out = block_return[0]
+            inter = block_return[1]
+        elif layer_type == 'f':
+            # print("feedfoward")
+            # print("x shape going in", x.shape)
+            # print("context shape going in", context.shape)
+            out = block(x)
+            # if self.adaLN:
+            #     out *= gate_mlp.unsqueeze(1)
+            # if self.dual_input and not is_last_layer:
+            #     context = second_block(context)
+            #     if self.adaLN:
+            #         context *= gate_mlp_context.unsqueeze(1)
+                # print("x shape coming out", out.shape)
+                # print("context shape coming out", context.shape)
+
+        # if self.resi_dual:
+        #     outer_residual = outer_residual + out * self.resi_dual_scale
+
+        if exists(post_branch_norm):
+            out = post_branch_norm(out)
+            # context = context_post_branch_norm(context) if self.dual_input else None
+
+        x = residual_fn(out, inner_residual)
+
+        # if self.dual_input and not (is_second_last_layer or is_last_layer):
+        #     # print("IND: ", ind)
+        #     # print("is_second_last_layer", is_second_last_layer)
+        #     # print("is_last_layer", is_last_layer)
+        #     context = context_residual_fn(context, inner_residual_context) if self.dual_input else None # TODO: NEED CONTEXT RESIDUAL AND ALSO THIS IS AN INTERMEDIATE TYPE FOR SOME REASON
+
+        # TODO: GET RESIDUAL GOING FOR CONTEXT/DUAL INPUT
+
+        # if layer_type in ('a', 'c') and return_hiddens:
+            # intermediates.append(inter)
+
+        # if layer_type == 'a' and self.residual_attn:
+        #     prev_attn = inter.pre_softmax_attn
+        # elif layer_type == 'c' and self.cross_residual_attn:
+        #     prev_cross_attn = inter.pre_softmax_attn
+
+        if exists(post_main_norm):
+            x = post_main_norm(x)
+            # context = context_post_main_norm(context) if self.dual_input else None
+
+        # if self.control_mode == "far" and control is not None and ind > decoder_split:
+        #     x = x + control[control_idx]
+        #     control_idx -= 1
+        # elif self.control_mode == "next" and control is not None and ind < decoder_split:
+        #     x = x + control[control_idx]
+        #     control_idx += 1
+        # ind += 1
+        return x, inter
 
 class AttentionLayers(nn.Module):
     def __init__(
@@ -1098,6 +1273,7 @@ class AttentionLayers(nn.Module):
         compile_layers = False,
         dual_input = False,
         adaLN = False,
+        unified_layers = False,
         **kwargs
     ):
         super().__init__()
@@ -1128,6 +1304,12 @@ class AttentionLayers(nn.Module):
 
         assert not (alibi_pos_bias and rel_pos_bias), 'you can only choose Alibi positional bias or T5 relative positional bias, not both'
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
+
+        # print("dual input: ", dual_input)
+        # print("adaln: ", adaLN)
+        # print("resi_dual: ", )
+        assert not (unified_layers and (dual_input or adaLN or resi_dual or cross_residual_attn or residual_attn)), "unified layers doesn't support dual_input, adaLN, control nets, cross_residual_attn, residual_attn, or resi_dual"
+        self.unified_layers = unified_layers
 
         # relative positional bias
 
@@ -1295,7 +1477,16 @@ class AttentionLayers(nn.Module):
                 adaLN_modulation = AdaLNModulation(dim)
                 context_adaLN_modulation = AdaLNModulation(dim) if dual_input and not is_second_last_layer else None
 
-            if compile_layers:
+            if unified_layers:
+                norms = nn.ModuleList(norms)
+                self.layers.append(AttentionLayer(
+                    layer_type=layer_type,
+                    layer_dropout=layer_dropout,
+                    norm=norms,
+                    block=layer,
+                    residual_fn=residual
+                ))
+            elif compile_layers:
                 norms = nn.ModuleList([torch.compile(norm, dynamic=False) if norm is not None else None for norm in norms])
 
                 self.layers.append(nn.ModuleList([
@@ -1412,7 +1603,22 @@ class AttentionLayers(nn.Module):
         elif self.control_mode == "next":
             control_idx = 0
         for i in self.layers_execute_order:
-            # print("Layer: ", i)
+            if self.unified_layers:
+                x, inter = self.layers[i](
+                    x, 
+                    context=context, 
+                    mask=mask, 
+                    context_mask=context_mask, 
+                    self_attn_kv_mask=self_attn_kv_mask,
+                    attn_mask=attn_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    layer_mem=mems.pop(0) if mems else None,
+                    rel_pos=self.rel_pos
+                )
+                if return_hiddens: # and layer_type in ('a', 'c')
+                    intermediates.append(inter)
+                continue
+    # print("Layer: ", i)
             layer_type = self.layer_types[i]
             layer_dropout = self.layer_dropouts[i]
             norm = self.layers[i][0]
@@ -1541,9 +1747,11 @@ class AttentionLayers(nn.Module):
                 x = x + control[control_idx]
                 control_idx += 1
             ind += 1
+        #TODO
 
         if return_hiddens:
             layer_hiddens.append(x)
+            
 
         if self.resi_dual:
             x = x + self.final_norm(outer_residual)
